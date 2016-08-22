@@ -1,0 +1,248 @@
+---
+output: 
+  html_document: 
+    keep_md: yes
+    theme: united
+---
+Project Assignment : Exercise Quality Predictor
+========================================================
+
+###Executive summary
+
+Using devices such as *Jawbone Up*, *Nike FuelBand* and *Fitbit* it is now possible to collect a large amount of data about personal activity relatively inexpensively. 
+
+One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. 
+
+In this project we aim to use the *Weight Lifting Exercise Dataset*, containing data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. Participants were asked to perform barbell lifts correctly and incorrectly in 5 different ways.
+
+We aim to design a prediction algorithm to correctly predict the quality of exercises defined by the variable "classe".
+
+This data is courtesy of http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+
+###Introduction
+
+We start by identifying whether files were already downloaded from the internet, downloading them if this is not the case, and loading the data into R.
+
+```{r Loading datasets, message=FALSE}
+
+library(dplyr)
+library(caret)
+
+knitr::opts_chunk$set(cache = TRUE, warning = FALSE)
+
+setwd("~/Documents/Courses/Data specialization Johns Hopkins/08_Practical Machine Learning/project/")
+if(!dir.exists("data")) dir.create("data")
+setwd("data")
+if(!file.exists("pml-training.csv")) download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", "pml-training.csv")
+if(!file.exists("test_cases.csv")) download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", "test_cases.csv")
+
+pml_training <- read.csv("pml-training.csv")
+test_cases <- read.csv("test_cases.csv")
+
+```
+
+###Exploring the data
+
+####Variables
+
+The outcome "classe" is categorical with 5 potential outcomes A to E. Distributions of outcomes are roughly equal, only classe A is more frequent than other outcomes. There is a large number of variables. Variables 1-7 seem trivial to the outcome.
+
+```{r Data exploration}
+
+ncol(pml_training)
+names(pml_training)
+dplyr::count(pml_training, classe)
+
+```
+
+####Correlations
+We make correlation matrices with the first 10 relevant variables to explore how the variables interact. 
+
+```{r Correlations}
+
+panel.cor <- function(x, y, digits=2, prefix="", cex.cor, ...)
+{
+    usr <- par("usr"); on.exit(par(usr))
+    par(usr = c(0, 1, 0, 1))
+    r <- abs(cor(x, y))
+    txt <- format(c(r, 0.123456789), digits=digits)[1]
+    txt <- paste(prefix, txt, sep="")
+    if(missing(cex.cor)) cex.cor <- 0.8/strwidth(txt)
+    text(0.5, 0.5, txt, cex = cex.cor * r)
+}
+
+pairs(~ ., data = pml_training[1:1000, 8:18],
+      lower.panel=panel.smooth, upper.panel=panel.cor, 
+      pch=20, main="Scatterplot Matrix: First 10 variables")
+
+```
+
+####Q-Q plots
+We also create a QQ-plot for 3 selected variables just to explore what those variables look like.
+
+```{r QQplot generation,  fig.height=3, fig.width=12}
+#do a series of QQ tables here
+par(mfrow = c(1, 3))
+qqnorm(pml_training$roll_arm, main = "roll_arm Normal Q-Q Plot")
+qqnorm(pml_training$accel_arm_x, main = "accel_arm_x Q-Q Plot")
+qqnorm(pml_training$magnet_arm_x, main = "magnet_arm_x Q-Q Plot")
+
+```
+
+We make the following observations about the predictors based on our explorations:
+- There is a large number of predictors
+- There is colinearity between predictors
+- predictors are not all normally distributed
+- There is a large number of NA predictor values
+
+We decide on the following options for prediction training
+- centering and scaling is indicated to normalize data 
+- we want to try out preprocessing with PCA to account for colinearity and dimension reduction
+- we want to deal with the large amounts of NA values
+
+
+###Data slicing
+
+We use the caret package to do some preprocessing to our data. First of all we remove variables 1 to 7 which are trivial. We make all data numerical except for the outcome. We then slice the pml_training set into separate training (75%) and testing (25%) fractions, following the advice given during the course to use these relative sizes in large datasets. From this point on all transformations are performed on the training set, and then in the same fashion on the testing set.
+
+```{r Data slicing}
+
+set.seed(123)
+
+pml_training <- pml_training[, 8:160]
+for(i in 1:152) pml_training[,i] <- as.numeric(as.character(pml_training[,i]))
+index <- createDataPartition(y = pml_training$classe, p = .75, list = FALSE)
+
+training <- pml_training[index, ]
+testing <- pml_training[-index, ]
+
+```
+
+
+###Preprocessing part 1
+
+We check which parameters have near zero variance and exclude those. To explore the amount of NA values in variables we then run a function that returns 0 if a variable does not have NAs and that returns the ratio of NA values to non NA values in the variable if any NA values are present.
+
+```{r Preprocessing part 1}
+
+set.seed(234)
+
+nzv <- nearZeroVar(training, saveMetrics = TRUE)
+training <- training[, which(nzv$nzv == FALSE)]
+testing <- testing[, which(nzv$nzv == FALSE)]
+
+NA_ratios <- apply(training, 2, function(x) {
+  if(any(is.na(x)) == FALSE) {
+    return(0)
+  } else {
+    return((length(x[which(is.na(x))])/length(x[which(!is.na(x))])))
+  }
+})
+
+NA_ratios
+
+training <- training[, which(NA_ratios == 0)]
+testing <- testing[, which(NA_ratios == 0)]
+
+```
+
+First we see that after leaving out variables with near zero variance 120 variables (including outcome) remain. Importantly, the outcome did not have near zero variance. If this were not the case we would have accidentally filtered out our outcome variable.
+It is clear that we still have a large amount of remaining variables, and that numbers of NA values in this set are high. We find that 53 variables (including the outcome) do not contain NA values. We also find that other variables all have >46 times as many NA values than non-NA values.
+
+Taking into account the large number of variables in the set, and the high ratio of NA values in a large number of variables, we decide not to impute the NA values but to fully exclude all variables holding NA values.
+
+
+###Preprocessing part 2
+
+We perform preprocessing by centering and scaling all data (as we have oberved before that data was not normally distributed). We perform a principal component analysis (PCA) to see whether we can perform dimension reduction without sacrificing too much accuracy in this fashion.
+
+```{r Preprocessing part 2}
+
+set.seed(345)
+
+training_ppvalues <- preProcess(training[,-53], method = c("center", "scale"))
+training_pp <- predict(training_ppvalues, training)
+testing_pp <- predict(training_ppvalues, testing)
+
+training_pp_PCA <- preProcess(training_pp[, -53], method="pca", pcaComp=9)
+PCs <- cbind(predict(training_pp_PCA, training_pp[, -53]), classe = training_pp[, 53])
+
+
+```
+
+###Training part 1: Linear Discriminant Analysis (LDA) with and without PCA
+
+We first attempt a training using LDA, a common and quick analysis method which can be used on categorical outcomes. We run a model were all predictors are included, and a second model where the PCs of the predictors are included. From the confusionMatrix output we can see that the accuracy of the LDA without principal component analysis is 0.7072, and 0.4115 with PCA.
+
+```{r Training part 1 (LDA)}
+
+set.seed(456)
+
+fit_lda <- train(classe ~ .,
+                    data = training_pp, 
+                    method = "lda", 
+                    verbose = FALSE)
+
+fit_lda_pca <- train(classe ~ .,
+                    data = PCs, 
+                    method = "lda", 
+                    verbose = FALSE)
+
+training_preds_lda <- predict(fit_lda, training_pp)
+training_preds_lda_pca <- predict(fit_lda_pca, PCs)
+
+confusionMatrix(training_preds_lda, training[, 53])
+confusionMatrix(training_preds_lda_pca, training[, 53])
+
+```
+
+We conclude that although these predictions are better than chance (Accuracy of ??0.2 with 5 categories), it is insufficient. We also note that PCA significantly does not improve the accuracy.
+
+###Training part 2: Random Forest modeling
+
+We decide to employ random forest modeling, which is a more powerful (and time consuming) algorithm. To make this analysis workable with limited processing time we perform them with a limited amount (= 100) of trees. We use all variables as input. We use 3-fold cross validation in order to decrease bias somewhat further, but use a low k in order to limit the computation time and because we are dealing with a large dataset.
+
+```{r Training part 2 (randomForest)}
+
+set.seed(567)
+
+fit_rf <- train(classe ~ ., 
+                    data = training_pp, 
+                    method = "rf", 
+                    ntree = 100,
+                    trControl=trainControl(method="cv",number=3),
+                    verbose = TRUE)
+
+training_pp_preds_rf <- predict(fit_rf, training_pp)
+testing_pp_preds_rf <- predict(fit_rf, testing_pp)
+
+confusionMatrix(training_pp_preds_rf, training[, 53])
+confusionMatrix(testing_pp_preds_rf, testing[, 53])
+
+```
+
+We see that the Accuracy is 100% on the training set, and 99.5% on the testing set. 99.5% Accuracy on the testing set implies an out-of-sample error rate of 0.5%, which should indicate sufficient performance to predict the 20 test samples. We perform the preprocessing and prediction on the test cases below. Our prediction give us a score of 20/20 in the quiz.
+
+###Prediction
+
+```{r Prediction of test cases, results='asis'}
+
+test_cases <- test_cases[, c(8:160)]
+for(i in 1:152) test_cases[,i] <- as.numeric(as.character(test_cases[,i]))
+test_cases <- test_cases[, which(nzv$nzv == FALSE)]
+test_cases <- test_cases[, which(NA_ratios == 0)]
+test_cases_pp <- predict(training_ppvalues, test_cases)
+
+
+assignment_predictions <- cbind(cases = c(1:20), prediction =  as.character(predict(fit_rf, test_cases_pp)))
+
+library(xtable)
+
+print(xtable(assignment_predictions), type = "html", include.rownames = FALSE, width = 4)
+
+```
+
+
+###Conclusion
+In this assignment we used random forest modelling to predict the fashion in which a weight lifting exercise was performed using biometric measurements collected during the exercise. We show that in this fashion we were able to generate a highly accurate model that accurately predicted a number of test cases.
